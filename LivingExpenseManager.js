@@ -23,27 +23,27 @@ var DEFAULT_CATEGORIES = {
 // 收入分类（通用）
 var INCOME_CATEGORIES = ["充值", "补贴", "月初初始化", "结转入账", "修正", "其他"];
 
-// 颜色主题
+// 颜色主题（现代扁平风格）
 var COLORS = {
-    primary: "#3F51B5",
-    primaryDark: "#303F9F",
-    accent: "#FF5722",
-    card: "#4CAF50",
-    activity: "#FF9800",
-    savings: "#9C27B0",
-    bg: "#F5F5F5",
+    primary: "#4361EE",
+    primaryDark: "#3A50D9",
+    accent: "#4361EE",
+    card: "#10B981",
+    activity: "#F59E0B",
+    savings: "#8B5CF6",
+    bg: "#F5F7FB",
     white: "#FFFFFF",
-    text: "#212121",
-    textSec: "#757575",
-    divider: "#E0E0E0",
-    red: "#F44336",
-    green: "#4CAF50"
+    text: "#1F2937",
+    textSec: "#6B7280",
+    divider: "#E9EDF3",
+    red: "#EF4444",
+    green: "#10B981"
 };
 
 // 饼图配色
 var PIE_COLORS = [
-    "#3F51B5", "#FF5722", "#4CAF50", "#FF9800", "#9C27B0",
-    "#00BCD4", "#E91E63", "#8BC34A", "#FFC107", "#795548"
+    "#4361EE", "#FF6B6B", "#10B981", "#F59E0B", "#8B5CF6",
+    "#06B6D4", "#EC4899", "#84CC16", "#F97316", "#94A3B8"
 ];
 
 // ======================== 工具函数 ========================
@@ -175,6 +175,9 @@ var DataManager = {
             }
             this.data.customCategories[mKey] = deduped;
         }
+
+        // 回填所有流水的"交易后余额"（旧数据/导入数据没有该字段时自动补齐）
+        this.recalcAllBalances();
     },
 
     /** 保存数据到持久化存储 */
@@ -352,6 +355,11 @@ var DataManager = {
             }
         }
 
+        // 记录该笔流水发生后的瞬时余额
+        if (module === "card") tx.balanceAfter = md.cardBalance;
+        else if (module === "activity") tx.balanceAfter = md.activityBalance;
+        else if (module === "savings") tx.balanceAfter = md.savingsBalance;
+
         this.save();
         return tx;
     },
@@ -374,6 +382,8 @@ var DataManager = {
                     else if (module === "savings") md.savingsBalance = floatAdd(md.savingsBalance, tx.amount);
                 }
                 txs.splice(i, 1);
+                // 删除中间某笔流水后，重算该模块后续流水的交易后余额
+                this.recalcModuleBalance(this.data.currentMonth, module);
                 this.save();
                 return true;
             }
@@ -471,7 +481,8 @@ var DataManager = {
                 amount: rechargeAmount,
                 category: "充值",
                 note: "月初充值",
-                timestamp: now()
+                timestamp: now(),
+                balanceAfter: md.cardBalance
             });
         }
 
@@ -483,7 +494,8 @@ var DataManager = {
                 amount: activityInitial,
                 category: "月初初始化",
                 note: "活动资金初始化",
-                timestamp: now()
+                timestamp: now(),
+                balanceAfter: md.activityBalance
             });
         }
 
@@ -507,7 +519,8 @@ var DataManager = {
                 amount: od.amount,
                 category: od.category,
                 note: od.note,
-                timestamp: now()
+                timestamp: now(),
+                balanceAfter: floatSub(md.savingsBalance, od.amount)
             });
             md.savingsBalance = floatSub(md.savingsBalance, od.amount);
             odTotal = floatAdd(odTotal, od.amount);
@@ -536,28 +549,34 @@ var DataManager = {
 
         // 活动资金支出记录（结转至存款贡献）
         if (activityBalance > 0) {
-            md.transactions.activity.push({
+            var settleActTx = {
                 id: generateId(),
                 type: "expense",
                 amount: activityBalance,
                 category: "结转至存款贡献",
                 note: "月末结转",
                 timestamp: now()
-            });
+            };
+            md.transactions.activity.push(settleActTx);
 
             // 存款贡献收入记录
-            md.transactions.savings.push({
+            var settleSavTx = {
                 id: generateId(),
                 type: "income",
                 amount: activityBalance,
                 category: "结转入账",
                 note: "从活动资金结转",
                 timestamp: now()
-            });
+            };
+            md.transactions.savings.push(settleSavTx);
 
             // 更新余额
             md.activityBalance = 0;
             md.savingsBalance = floatAdd(md.savingsBalance, activityBalance);
+
+            // 记录结转流水发生后的瞬时余额
+            settleActTx.balanceAfter = md.activityBalance;
+            settleSavTx.balanceAfter = md.savingsBalance;
         }
 
         md.settled = true;
@@ -604,6 +623,43 @@ var DataManager = {
             this.data.customCategories[module].push(name);
             this.save();
         }
+    },
+
+    /** 重算某月某模块所有流水的"交易后余额"（balanceAfter）。
+     *  原理：用当前余额反推出第一笔流水发生前的起始余额，再按流水顺序逐笔累加。 */
+    recalcModuleBalance: function (monthKey, module) {
+        var md = this.data.months[monthKey];
+        if (!md || !md.transactions) return;
+        var txs = md.transactions[module] || [];
+        if (txs.length === 0) return;
+        var currentBalance;
+        if (module === "card") currentBalance = md.cardBalance || 0;
+        else if (module === "activity") currentBalance = md.activityBalance || 0;
+        else if (module === "savings") currentBalance = md.savingsBalance || 0;
+        else return;
+        // 全部流水的净影响
+        var net = 0;
+        var i;
+        for (i = 0; i < txs.length; i++) {
+            net = (txs[i].type === "income") ? floatAdd(net, txs[i].amount) : floatSub(net, txs[i].amount);
+        }
+        // 反推起始余额后逐笔推算
+        var bal = floatSub(currentBalance, net);
+        for (i = 0; i < txs.length; i++) {
+            bal = (txs[i].type === "income") ? floatAdd(bal, txs[i].amount) : floatSub(bal, txs[i].amount);
+            txs[i].balanceAfter = bal;
+        }
+    },
+
+    /** 重算所有月份所有模块的交易后余额（启动/导入时回填旧数据） */
+    recalcAllBalances: function () {
+        var keys = Object.keys(this.data.months);
+        var mods = ["card", "activity", "savings"];
+        for (var i = 0; i < keys.length; i++) {
+            for (var m = 0; m < mods.length; m++) {
+                this.recalcModuleBalance(keys[i], mods[m]);
+            }
+        }
     }
 };
 
@@ -636,55 +692,66 @@ var UIState = {
 
 // ======================== 主布局 ========================
 
+// 应用现代主题色（影响对话框强调色、Colored 按钮等着色）
+try {
+    if (ui.theme) {
+        ui.theme.colorPrimary = COLORS.primary;
+        ui.theme.colorPrimaryDark = COLORS.primaryDark;
+        ui.theme.colorAccent = COLORS.accent;
+    }
+} catch (e) {
+    // 当前运行环境不支持主题设置时忽略
+}
+
 ui.layout(
     <frame w="*" h="*">
         <vertical w="*" h="*">
             <!-- 顶部标题栏 -->
             <frame bg="{{COLORS.primary}}" w="*" h="56dp" gravity="center_vertical" padding="16dp 0dp 16dp 0dp">
-                <text id="tvTitle" text="{{APP_NAME}}" textColor="white" textSize="20sp" gravity="center" w="*"/>
+                <text id="tvTitle" text="{{APP_NAME}}" textColor="white" textSize="20sp" textStyle="bold" gravity="center" w="*"/>
             </frame>
 
             <!-- 内容区域 -->
             <frame w="*" h="*" layout_weight="1">
                 <!-- 总览页 -->
-                <ScrollView id="tabOverview" w="*" h="*" visibility="visible">
+                <ScrollView id="tabOverview" w="*" h="*" visibility="visible" bg="{{COLORS.bg}}">
                     <vertical w="*" h="*" padding="12dp">
-                        <!-- 月份信息 -->
-                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="2dp" foreground="?selectableItemBackground" margin="0dp 0dp 0dp 8dp">
-                            <vertical padding="16dp" w="*">
-                                <text id="tvMonth" text="2026-09" textSize="16sp" textColor="{{COLORS.text}}" textStyle="bold"/>
-                                <horizontal margin="0dp 4dp 0dp 0dp">
-                                    <text id="tvBudget" text="生活费: ¥0" textSize="13sp" textColor="{{COLORS.textSec}}" layout_weight="1"/>
-                                    <text id="tvStandard" text="标准: ¥0" textSize="13sp" textColor="{{COLORS.textSec}}" layout_weight="1"/>
-                                    <text id="tvRecharge" text="充值: ¥0" textSize="13sp" textColor="{{COLORS.textSec}}" layout_weight="1"/>
+                        <!-- 月份信息（主题色英雄卡） -->
+                        <card w="*" h="auto" cardCornerRadius="16dp" cardElevation="1dp" cardBackgroundColor="{{COLORS.primary}}" foreground="?selectableItemBackground" margin="0dp 0dp 0dp 10dp">
+                            <vertical padding="20dp" w="*">
+                                <text id="tvMonth" text="2026-09" textSize="22sp" textColor="white" textStyle="bold"/>
+                                <horizontal margin="0dp 8dp 0dp 0dp">
+                                    <text id="tvBudget" text="生活费: ¥0" textSize="12sp" textColor="#D6DEFF" layout_weight="1"/>
+                                    <text id="tvStandard" text="标准: ¥0" textSize="12sp" textColor="#D6DEFF" layout_weight="1"/>
+                                    <text id="tvRecharge" text="充值: ¥0" textSize="12sp" textColor="#D6DEFF" layout_weight="1"/>
                                 </horizontal>
                             </vertical>
                         </card>
 
                         <!-- 校园卡余额卡 -->
-                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="2dp" margin="0dp 0dp 0dp 8dp">
-                            <horizontal padding="16dp" w="*" gravity="center_vertical">
+                        <card w="*" h="auto" cardCornerRadius="16dp" cardElevation="1dp" margin="0dp 0dp 0dp 10dp">
+                            <horizontal padding="20dp" w="*" gravity="center_vertical">
                                 <vertical layout_weight="1">
-                                    <text text="💳 校园卡" textSize="15sp" textColor="{{COLORS.card}}" textStyle="bold"/>
-                                    <text id="tvCardBalance" text="¥0.00" textSize="24sp" textColor="{{COLORS.text}}" margin="0dp 4dp 0dp 0dp"/>
+                                    <text text="💳 校园卡" textSize="14sp" textColor="{{COLORS.card}}" textStyle="bold"/>
+                                    <text id="tvCardBalance" text="¥0.00" textSize="28sp" textStyle="bold" textColor="{{COLORS.text}}" margin="0dp 6dp 0dp 0dp"/>
                                 </vertical>
                                 <button id="btnCardDetail" text="明细" textSize="12sp" style="Widget.AppCompat.Button.Borderless" textColor="{{COLORS.card}}"/>
                             </horizontal>
                         </card>
 
                         <!-- 活动资金余额卡 -->
-                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="2dp" margin="0dp 0dp 0dp 8dp">
-                            <horizontal padding="16dp" w="*" gravity="center_vertical">
+                        <card w="*" h="auto" cardCornerRadius="16dp" cardElevation="1dp" margin="0dp 0dp 0dp 10dp">
+                            <horizontal padding="20dp" w="*" gravity="center_vertical">
                                 <vertical layout_weight="1">
-                                    <text text="🎯 活动资金" textSize="15sp" textColor="{{COLORS.activity}}" textStyle="bold"/>
-                                    <text id="tvActivityBalance" text="¥0.00" textSize="24sp" textColor="{{COLORS.text}}" margin="0dp 4dp 0dp 0dp"/>
+                                    <text text="🎯 活动资金" textSize="14sp" textColor="{{COLORS.activity}}" textStyle="bold"/>
+                                    <text id="tvActivityBalance" text="¥0.00" textSize="28sp" textStyle="bold" textColor="{{COLORS.text}}" margin="0dp 6dp 0dp 0dp"/>
                                 </vertical>
                                 <button id="btnActivityDetail" text="明细" textSize="12sp" style="Widget.AppCompat.Button.Borderless" textColor="{{COLORS.activity}}"/>
                             </horizontal>
                         </card>
 
                         <!-- 总存款贡献统计（全历史累计，无明细按钮，样式区别于其他余额卡片） -->
-                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="2dp" cardBackgroundColor="{{COLORS.savings}}" margin="0dp 0dp 0dp 8dp">
+                        <card w="*" h="auto" cardCornerRadius="16dp" cardElevation="1dp" cardBackgroundColor="{{COLORS.savings}}" margin="0dp 0dp 0dp 8dp">
                             <vertical padding="16dp" w="*">
                                 <horizontal w="*" gravity="center_vertical">
                                     <text text="🏆 总存款贡献" textSize="15sp" textColor="white" textStyle="bold" layout_weight="1"/>
@@ -700,7 +767,7 @@ ui.layout(
                         </card>
 
                         <!-- 操作按钮区 -->
-                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="2dp" margin="0dp 8dp 0dp 0dp">
+                        <card w="*" h="auto" cardCornerRadius="16dp" cardElevation="1dp" margin="0dp 8dp 0dp 0dp">
                             <vertical padding="12dp" w="*">
                                 <horizontal w="*" gravity="center">
                                     <button id="btnNewMonth" text="📅 开启新月" layout_weight="1" textSize="13sp" margin="4dp 0dp 4dp 0dp" style="Widget.AppCompat.Button.Colored"/>
@@ -719,7 +786,7 @@ ui.layout(
                 </ScrollView>
 
                 <!-- 流水页 -->
-                <vertical id="tabTransactions" w="*" h="*" visibility="gone">
+                <vertical id="tabTransactions" w="*" h="*" visibility="gone" bg="{{COLORS.bg}}">
                     <!-- 展示月份调节 -->
                     <horizontal w="*" h="36dp" bg="{{COLORS.white}}" gravity="center_vertical" padding="4dp 0dp 4dp 0dp">
                         <button id="btnTxMonthPrev" text="◀" w="48dp" h="*" textSize="14sp" style="Widget.AppCompat.Button.Borderless" textColor="{{COLORS.primary}}"/>
@@ -728,7 +795,7 @@ ui.layout(
                     </horizontal>
                     <View w="*" h="1dp" bg="{{COLORS.divider}}"/>
                     <!-- 模块选择 Tab -->
-                    <horizontal w="*" h="40dp" bg="{{COLORS.bg}}">
+                    <horizontal w="*" h="40dp" bg="{{COLORS.white}}">
                         <button id="tabTxCard" text="校园卡" layout_weight="1" h="*" textSize="13sp" style="Widget.AppCompat.Button.Borderless" textColor="{{COLORS.textSec}}"/>
                         <button id="tabTxActivity" text="活动资金" layout_weight="1" h="*" textSize="13sp" style="Widget.AppCompat.Button.Borderless" textColor="{{COLORS.activity}}"/>
                         <button id="tabTxSavings" text="存款贡献" layout_weight="1" h="*" textSize="13sp" style="Widget.AppCompat.Button.Borderless" textColor="{{COLORS.textSec}}"/>
@@ -751,6 +818,7 @@ ui.layout(
         </horizontal>
         <horizontal w="*" margin="0dp 2dp 0dp 0dp">
             <text id="tvTxNote" text="{{tvTxNote}}" textSize="12sp" textColor="{{COLORS.textSec}}" layout_weight="1"/>
+            <text id="tvTxBalance" text="{{tvTxBalance}}" textSize="11sp" textColor="{{COLORS.textSec}}" margin="0dp 0dp 8dp 0dp"/>
             <text id="tvTxTime" text="{{tvTxTime}}" textSize="11sp" textColor="{{COLORS.textSec}}"/>
         </horizontal>
     </vertical>
@@ -760,7 +828,7 @@ ui.layout(
                 </vertical>
 
                 <!-- 图表页 -->
-                <ScrollView id="tabCharts" w="*" h="*" visibility="gone">
+                <ScrollView id="tabCharts" w="*" h="*" visibility="gone" bg="{{COLORS.bg}}">
                     <vertical w="*" h="*" padding="12dp">
                         <!-- 展示月份调节（配合"按月"范围使用） -->
                         <horizontal w="*" h="36dp" gravity="center_vertical" padding="4dp 0dp 4dp 0dp">
@@ -778,13 +846,13 @@ ui.layout(
                             <button id="chartAll" text="全部" layout_weight="1" textSize="12sp" style="Widget.AppCompat.Button.Borderless" textColor="{{COLORS.textSec}}"/>
                         </horizontal>
                         <!-- 饼图 -->
-                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="2dp" margin="0dp 8dp 0dp 8dp">
+                        <card w="*" h="auto" cardCornerRadius="16dp" cardElevation="1dp" margin="0dp 8dp 0dp 8dp">
                             <vertical w="*" h="auto" padding="8dp" gravity="center">
                                 <canvas id="pieCanvas" w="280dp" h="280dp"/>
                             </vertical>
                         </card>
                         <!-- 分类统计列表 -->
-                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="2dp" margin="0dp 0dp 0dp 8dp">
+                        <card w="*" h="auto" cardCornerRadius="16dp" cardElevation="1dp" margin="0dp 0dp 0dp 8dp">
                             <vertical id="chartLegend" w="*" h="auto" padding="12dp">
                                 <text text="支出分类统计" textSize="14sp" textStyle="bold" textColor="{{COLORS.text}}"/>
                             </vertical>
@@ -793,10 +861,10 @@ ui.layout(
                 </ScrollView>
 
                 <!-- 设置页 -->
-                <ScrollView id="tabSettings" w="*" h="*" visibility="gone">
+                <ScrollView id="tabSettings" w="*" h="*" visibility="gone" bg="{{COLORS.bg}}">
                     <vertical w="*" h="*" padding="12dp">
                         <!-- 当前月份管理 -->
-                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="2dp" margin="0dp 0dp 0dp 8dp">
+                        <card w="*" h="auto" cardCornerRadius="16dp" cardElevation="1dp" margin="0dp 0dp 0dp 8dp">
                             <vertical padding="16dp" w="*">
                                 <text text="当前月份管理" textSize="16sp" textStyle="bold" textColor="{{COLORS.text}}"/>
                                 <horizontal w="*" margin="0dp 8dp 0dp 0dp" gravity="center_vertical">
@@ -808,7 +876,7 @@ ui.layout(
                         </card>
 
                         <!-- 校园卡月标准 -->
-                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="2dp" margin="0dp 0dp 0dp 8dp">
+                        <card w="*" h="auto" cardCornerRadius="16dp" cardElevation="1dp" margin="0dp 0dp 0dp 8dp">
                             <vertical padding="16dp" w="*">
                                 <text text="校园卡月标准" textSize="16sp" textStyle="bold" textColor="{{COLORS.text}}"/>
                                 <horizontal w="*" margin="0dp 8dp 0dp 0dp" gravity="center_vertical">
@@ -820,7 +888,7 @@ ui.layout(
                         </card>
 
                         <!-- 自定义分类 -->
-                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="2dp" margin="0dp 0dp 0dp 8dp">
+                        <card w="*" h="auto" cardCornerRadius="16dp" cardElevation="1dp" margin="0dp 0dp 0dp 8dp">
                             <vertical padding="16dp" w="*">
                                 <text text="自定义分类" textSize="16sp" textStyle="bold" textColor="{{COLORS.text}}"/>
                                 <horizontal margin="0dp 8dp 0dp 0dp">
@@ -831,7 +899,7 @@ ui.layout(
                         </card>
 
                         <!-- 标准修改历史 -->
-                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="2dp" margin="0dp 0dp 0dp 8dp">
+                        <card w="*" h="auto" cardCornerRadius="16dp" cardElevation="1dp" margin="0dp 0dp 0dp 8dp">
                             <vertical padding="16dp" w="*">
                                 <text text="标准修改历史" textSize="16sp" textStyle="bold" textColor="{{COLORS.text}}"/>
                                 <vertical id="standardHistoryList" w="*" h="auto" margin="0dp 8dp 0dp 0dp">
@@ -841,7 +909,7 @@ ui.layout(
                         </card>
 
                         <!-- 数据管理 -->
-                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="2dp" margin="0dp 0dp 0dp 8dp">
+                        <card w="*" h="auto" cardCornerRadius="16dp" cardElevation="1dp" margin="0dp 0dp 0dp 8dp">
                             <vertical padding="16dp" w="*">
                                 <text text="数据管理" textSize="16sp" textStyle="bold" textColor="{{COLORS.text}}"/>
                                 <horizontal margin="0dp 8dp 0dp 0dp">
@@ -857,7 +925,7 @@ ui.layout(
                         </card>
 
                         <!-- 关于 -->
-                        <card w="*" h="auto" cardCornerRadius="8dp" cardElevation="2dp" margin="0dp 0dp 0dp 8dp">
+                        <card w="*" h="auto" cardCornerRadius="16dp" cardElevation="1dp" margin="0dp 0dp 0dp 8dp">
                             <vertical padding="16dp" w="*">
                                 <text text="关于" textSize="16sp" textStyle="bold" textColor="{{COLORS.text}}"/>
                                 <text text="生活费管理 App v1.0" textSize="13sp" textColor="{{COLORS.textSec}}" margin="0dp 4dp 0dp 0dp"/>
@@ -869,22 +937,23 @@ ui.layout(
             </frame>
 
             <!-- 底部导航栏 -->
-            <horizontal w="*" h="52dp" bg="{{COLORS.white}}" gravity="center_vertical">
+            <View w="*" h="1dp" bg="{{COLORS.divider}}"/>
+            <horizontal w="*" h="56dp" bg="{{COLORS.white}}" gravity="center_vertical">
                 <vertical id="nav0" w="0" h="*" layout_weight="1" gravity="center">
-                    <text id="navIcon0" text="📊" textSize="18sp" gravity="center"/>
-                    <text id="navLabel0" text="总览" textSize="10sp" textColor="{{COLORS.primary}}" gravity="center"/>
+                    <text id="navIcon0" text="📊" textSize="20sp" gravity="center"/>
+                    <text id="navLabel0" text="总览" textSize="11sp" textColor="{{COLORS.primary}}" textStyle="bold" gravity="center"/>
                 </vertical>
                 <vertical id="nav1" w="0" h="*" layout_weight="1" gravity="center">
-                    <text id="navIcon1" text="📋" textSize="18sp" gravity="center"/>
-                    <text id="navLabel1" text="流水" textSize="10sp" textColor="{{COLORS.textSec}}" gravity="center"/>
+                    <text id="navIcon1" text="📋" textSize="20sp" gravity="center"/>
+                    <text id="navLabel1" text="流水" textSize="11sp" textColor="{{COLORS.textSec}}" gravity="center"/>
                 </vertical>
                 <vertical id="nav2" w="0" h="*" layout_weight="1" gravity="center">
-                    <text id="navIcon2" text="📈" textSize="18sp" gravity="center"/>
-                    <text id="navLabel2" text="图表" textSize="10sp" textColor="{{COLORS.textSec}}" gravity="center"/>
+                    <text id="navIcon2" text="📈" textSize="20sp" gravity="center"/>
+                    <text id="navLabel2" text="图表" textSize="11sp" textColor="{{COLORS.textSec}}" gravity="center"/>
                 </vertical>
                 <vertical id="nav3" w="0" h="*" layout_weight="1" gravity="center">
-                    <text id="navIcon3" text="⚙️" textSize="18sp" gravity="center"/>
-                    <text id="navLabel3" text="设置" textSize="10sp" textColor="{{COLORS.textSec}}" gravity="center"/>
+                    <text id="navIcon3" text="⚙️" textSize="20sp" gravity="center"/>
+                    <text id="navLabel3" text="设置" textSize="11sp" textColor="{{COLORS.textSec}}" gravity="center"/>
                 </vertical>
             </horizontal>
         </vertical>
@@ -1060,6 +1129,7 @@ function renderTransactions() {
             tvTxCat: tx.category || "其他",
             tvTxAmount: (tx.type === "income" ? "+" : "-") + formatMoney(tx.amount),
             tvTxNote: tx.note || "",
+            tvTxBalance: (tx.balanceAfter !== undefined && tx.balanceAfter !== null) ? "余 " + formatMoney(tx.balanceAfter) : "",
             tvTxTime: shortTime(tx.timestamp),
             _type: tx.type,
             // 金额颜色：收入绿、支出红，供模板中 {{_amountColor}} 绑定
@@ -2082,6 +2152,7 @@ function showTransactionDetailDialog(module, txId) {
         content: "模块: " + moduleNames[module] + "\n" +
                  "类型: " + typeNames[tx.type] + "\n" +
                  "金额: " + formatMoney(tx.amount) + "\n" +
+                 "交易后余额: " + ((tx.balanceAfter !== undefined && tx.balanceAfter !== null) ? formatMoney(tx.balanceAfter) : "无记录") + "\n" +
                  "分类: " + tx.category + "\n" +
                  "备注: " + (tx.note || "无") + "\n" +
                  "时间: " + formatTime(tx.timestamp),
@@ -2756,7 +2827,7 @@ function exportCsvReport() {
         var i, m, t, k2;
 
         // 第一部分：流水明细
-        lines.push("月份,模块,类型,金额,分类,备注,时间");
+        lines.push("月份,模块,类型,金额,交易后余额,分类,备注,时间");
         for (i = 0; i < chosen.length; i++) {
             var key = chosen[i];
             var md = DataManager.peekMonthData(key);
@@ -2771,6 +2842,7 @@ function exportCsvReport() {
                         MODULE_NAMES[mods[m]],
                         tx.type === "income" ? "收入" : "支出",
                         Number(tx.amount).toFixed(2),
+                        (tx.balanceAfter !== undefined && tx.balanceAfter !== null) ? Number(tx.balanceAfter).toFixed(2) : "",
                         tx.category || "",
                         tx.note || "",
                         formatTime(tx.timestamp)
